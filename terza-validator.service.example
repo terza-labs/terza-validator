@@ -1,0 +1,22 @@
+[Unit]
+Description=Terza validator (evaluation only; add --submit to set weights)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=terza-validator
+WorkingDirectory=/opt/terza-validator
+ExecStart=/opt/terza-validator/.venv/bin/python -u terza_validator.py --config /etc/terza-validator/validator.json --watch
+Restart=on-failure
+RestartSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/terza-validator
+MemoryMax=512M
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

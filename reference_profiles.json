@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "note": "Calibrated from a trusted source, never from miners. Changing a profile is a scoring change: bump VERSION in terza_validator.py.",
+  "models": {
+    "gpt-6.1-sol": {
+      "hard_accuracy": 0.75,
+      "median_reasoning_tokens": 278,
+      "median_latency_seconds": 4.6,
+      "samples": 40,
+      "calibrated_at": "2026-10-19",
+      "source": "trusted reference account, direct (not a miner)"
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "network": "test",
+  "netuid": null,
+  "models": [
+    "REPLACE_WITH_BENCHMARK_MODEL_ID"
+  ],
+  "gateway_url": "https://terza.si",
+  "gateway_public_keys": [
+    "REPLACE_WITH_PUBLIC_KEY_FROM_/api/public/gateway-identity"
+  ],
+  "api_key_file": "/etc/terza-validator/api-key.json",
+  "state_dir": "/var/lib/terza-validator",
+  "validator_hotkey": "REPLACE_WITH_VALIDATOR_PUBLIC_HOTKEY",
+  "wallet_name": "your-wallet",
+  "wallet_hotkey": "your-validator-hotkey",
+  "wallet_path": "/home/validator/.bittensor/wallets",
+  "password_file": "/etc/terza-validator/hotkey-password.json"
+}
