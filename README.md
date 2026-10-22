@@ -58,6 +58,14 @@ three days, and compared with `reference_profiles.json`:
 Reference profiles are calibrated from a trusted source with `calibrate.py`, never
 from miners. Changing a profile requires a `VERSION` bump.
 
+**Image, speech, transcription and video offers** are bought like any other request:
+a 1024×1024 image, a one-sentence speech clip, the transcription of a one-second tone,
+or a 5-second video at the cheapest quoted resolution. Images, speech and transcription
+are probed about 6 times a day, video twice a day; a probe passes when the gateway
+returns conforming output. They then pass the same gates and compete on price within
+each model group. With at least 3 probes in 3 days, the latest within 12 hours (36 for
+video).
+
 **Media offers** are scored on availability and output conformance, not automated
 quality. About 6 paid probes per offer per day use the cheapest settings the offer
 declares. Availability and conformance must each be at least 90%; passing media

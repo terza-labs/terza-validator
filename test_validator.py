@@ -144,6 +144,45 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(score(old)[1]['reason'],'stale_evidence')
         self.assertGreater(score(old,fresh=1200)[0],0)
 
+    def test_unit_offers_are_parsed_probed_and_scored(self):
+        import terza_validator as tv
+        base={'protocols':[],'input_price_per_m':'0','output_price_per_m':'0','max_input_tokens':4096,'max_output_tokens':4096,
+              'quote_valid_until':'2999-01-01T00:00:00Z'}
+        data={'offers':[
+            {**base,'offer_id':'admitted_a_1_0','hotkey':'a','model_id':'img','protocols':['images'],'unit_prices':{'images':'0.04'}},
+            {**base,'offer_id':'admitted_b_1_0','hotkey':'b','model_id':'img','protocols':['images'],'unit_prices':{'images':'0.02'}},
+            {**base,'offer_id':'admitted_c_1_0','hotkey':'c','model_id':'vid','protocols':['video'],
+             'video_rates':[{'resolution':'720p','billing_unit':'million_tokens','without_reference':'10','with_reference':'10'},
+                            {'resolution':'480p','billing_unit':'million_tokens','without_reference':'7','with_reference':'7'}]},
+            {**base,'offer_id':'admitted_d_1_0','hotkey':'d','model_id':'tts','protocols':['speech'],'unit_prices':{}}]}
+        offers=tv.parse_offers(data,{**CONFIG,'models':'*'})
+        kinds={o.model:(o.kind,o.unit,o.resolution) for o in offers}
+        self.assertEqual(kinds['vid'],('video',7.0,'480p'),'cheapest quoted resolution')
+        self.assertNotIn('tts',kinds,'unit offers need a positive unit price')
+        self.assertEqual(tv.probes_per_day(next(o for o in offers if o.kind=='video')),tv.VIDEO_PROBES_PER_DAY)
+        # Synchronous probes: conforming output passes, a 200 without content does not.
+        img=next(o for o in offers if o.hotkey=='a')
+        with patch('terza_validator.fetch',return_value=(200,b'{"data":[{"b64_json":"AAAA"}]}',3.0)),patch('terza_validator.api_key',return_value='k'):
+            self.assertEqual(tv.unit_run(CONFIG,img),3.0)
+        with patch('terza_validator.fetch',return_value=(200,b'{"data":[]}',3.0)),patch('terza_validator.api_key',return_value='k'):
+            with self.assertRaises(ValueError): tv.unit_run(CONFIG,img)
+        with patch('terza_validator.fetch',return_value=(402,b'{}',0.1)),patch('terza_validator.api_key',return_value='k'):
+            with self.assertRaises(Inconclusive): tv.unit_run(CONFIG,img)
+        # Video jobs map onto the media-task states.
+        with patch('terza_validator.fetch',return_value=(200,b'{"status":"completed"}',1)),patch('terza_validator.api_key',return_value='k'):
+            self.assertEqual(tv.media_status(CONFIG,'video:tzvid_1')['status'],'succeeded')
+        with patch('terza_validator.fetch',return_value=(200,b'{"status":"failed"}',1)),patch('terza_validator.api_key',return_value='k'):
+            self.assertEqual(tv.media_status(CONFIG,'video:tzvid_1')['error']['code'],'miner_failed')
+        # Scored like media: gates first, then price within the model group.
+        for i,o in enumerate(offers): o.uid=i+1
+        class E:
+            def recent(self,f,window=3600): return []
+            def hard(self,s): return []
+            def media(self,subject): return [{'ok':1,'latency':5,'started':time.time()} for _ in range(3)]
+        result,details=weights(offers,E(),['img','vid'])
+        self.assertAlmostEqual(result['b']/result['a'],2,places=6)
+        self.assertAlmostEqual(result['c'],0.5)
+
     def test_organic_success_is_a_gate(self):
         class E:
             def recent(self,f,window=3600): return samples()

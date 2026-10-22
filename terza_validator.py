@@ -112,6 +112,16 @@ REFERENCE_FILE = Path(__file__).with_name('reference_profiles.json')
 # Media offers: scored on availability and conformance, not
 # on automated quality. Probes are real paid tasks using the cheapest declared settings.
 MEDIA_PROBES_PER_DAY = 6
+# Unit-priced offers (images, speech, transcription, video) reuse the media evidence
+# pipeline. Video probes are the expensive ones, so they run less often and stay
+# fresh for longer.
+UNIT_KINDS = ('images', 'speech', 'transcriptions', 'video')
+VIDEO_PROBES_PER_DAY = 2
+VIDEO_FRESH_HOURS = 36
+VIDEO_PROBE_SECONDS = 5
+SPEECH_PROBE = 'Terza checks this voice once in a while. The weather is calm today.'
+IMAGE_PROMPTS = ('A red ball on a wooden table', 'A lighthouse on a calm sea at dusk', 'A paper boat on a rainy street',
+                 'A cup of tea beside an open book')
 MEDIA_WINDOW_DAYS = 3
 MEDIA_MIN_SAMPLES = 3
 MEDIA_FRESH_HOURS = 12
@@ -170,6 +180,8 @@ class Offer:
     max_output: int = 1024
     kind: str = 'text'
     media: dict = dataclasses.field(default_factory=dict, compare=False)
+    unit: float = 0          # images/transcriptions: per request; speech: per 1,000 chars; video: per 1M tokens
+    resolution: str = ''     # video probe resolution (the cheapest quoted)
 
     @property
     def subject(self):
@@ -191,8 +203,24 @@ class Offer:
         if self.kind == 'media':
             plan = media_plan(self.media)
             return plan['reserve'] if plan else 0
+        if self.kind in ('images', 'transcriptions'):
+            return self.unit
+        if self.kind == 'speech':
+            return self.unit * len(SPEECH_PROBE) / 1000
+        if self.kind == 'video':
+            return self.unit * video_tokens(self.resolution, VIDEO_PROBE_SECONDS) / 1_000_000
         # Standard workload quote, NOT untrusted miner-reported token counts.
         return (512 * self.input_price + 128 * self.output_price) / 1_000_000
+
+
+def video_tokens(resolution, seconds):
+    """Typical output tokens of a generated video (width × height × 24 fps × seconds ÷ 1024)."""
+    w, h = {'480p': (854, 480), '720p': (1280, 720), '1080p': (1920, 1080), '1440p': (2560, 1440)}.get(resolution, (3840, 2160))
+    return w * h * 24 * seconds // 1024
+
+
+def probes_per_day(o):
+    return VIDEO_PROBES_PER_DAY if o.kind == 'video' else MEDIA_PROBES_PER_DAY
 
 
 def probe_png(size=512):
@@ -286,6 +314,26 @@ def parse_offers(data, c):
                 seen.add((m['hotkey'], model))
                 offers.append(Offer(m['offer_id'], m['hotkey'], model, 0, 0, expiry, stats=m.get('stats_24h', {}),
                                     kind='media', media=m['media']))
+            continue
+        unit_kind = next((k for k in UNIT_KINDS if k in m.get('protocols', [])), None)
+        if unit_kind and 'chat' not in m.get('protocols', []):
+            expiry = dt.datetime.fromisoformat(m['quote_valid_until'].replace('Z', '+00:00')).timestamp()
+            if expiry <= time.time():
+                continue
+            if unit_kind == 'video':
+                rows = [x for x in m.get('video_rates') or [] if x.get('billing_unit') == 'million_tokens'
+                        and x.get('without_reference') and x.get('resolution') in TIERS]
+                if not rows:
+                    continue
+                row = min(rows, key=lambda x: TIERS.index(x['resolution']))
+                unit, resolution = float(row['without_reference']), row['resolution']
+            else:
+                unit, resolution = float((m.get('unit_prices') or {}).get(unit_kind) or 0), ''
+            if not (math.isfinite(unit) and unit > 0):
+                continue
+            seen.add((m['hotkey'], model))
+            offers.append(Offer(m['offer_id'], m['hotkey'], model, 0, 0, expiry, stats=m.get('stats_24h', {}),
+                                kind=unit_kind, unit=unit, resolution=resolution))
             continue
         if 'chat' not in m.get('protocols', []):
             continue
@@ -460,10 +508,83 @@ def media_submit(c, offer, plan):
 
 
 def media_status(c, task):
+    if task.startswith('video:'):
+        return video_status(c, task[6:])
     status, body, _ = fetch(c, 'GET', f'/v1/media/tasks/{task}', {'Authorization': 'Bearer ' + api_key(c)})
     if status != 200:
         raise Inconclusive(f'gateway_{status}')
     return json.loads(body)
+
+
+def probe_wav(seconds=1, rate=16000):
+    """A short 440 Hz tone as a WAV file, for transcription availability probes."""
+    import struct
+    frames = b''.join(struct.pack('<h', int(8000 * math.sin(2 * math.pi * 440 * i / rate))) for i in range(seconds * rate))
+    return (b'RIFF' + struct.pack('<I', 36 + len(frames)) + b'WAVEfmt ' + struct.pack('<IHHIIHH', 16, 1, 1, rate, rate * 2, 2, 16)
+            + b'data' + struct.pack('<I', len(frames)) + frames)
+
+
+def unit_run(c, offer):
+    """One synchronous paid probe (image, speech or transcription). Returns latency; raises on failure."""
+    auth = {'Authorization': 'Bearer ' + api_key(c), 'X-Terza-Offer': offer.offer_id}
+    if offer.kind == 'images':
+        status, body, latency = fetch(c, 'POST', '/v1/images/generations', {**auth, 'Content-Type': 'application/json'},
+                                      json.dumps({'model': offer.model, 'prompt': secrets.choice(IMAGE_PROMPTS), 'n': 1, 'size': '1024x1024'}),
+                                      deadline=PROBE_DEADLINE * 3, limit=24 * 1024 * 1024)
+        check = lambda: any(x.get('b64_json') or x.get('url') for x in json.loads(body).get('data', []))
+    elif offer.kind == 'speech':
+        status, body, latency = fetch(c, 'POST', '/v1/audio/speech', {**auth, 'Content-Type': 'application/json'},
+                                      json.dumps({'model': offer.model, 'input': SPEECH_PROBE, 'voice': 'alloy'}),
+                                      deadline=PROBE_DEADLINE, limit=8 * 1024 * 1024)
+        check = lambda: len(body) > 1000
+    else:
+        boundary = secrets.token_hex(12)
+        form = (f'--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n{offer.model}\r\n'
+                f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="probe.wav"\r\n'
+                'Content-Type: audio/wav\r\n\r\n').encode() + probe_wav() + f'\r\n--{boundary}--\r\n'.encode()
+        status, body, latency = fetch(c, 'POST', '/v1/audio/transcriptions',
+                                      {**auth, 'Content-Type': 'multipart/form-data; boundary=' + boundary}, form,
+                                      deadline=PROBE_DEADLINE, limit=1024 * 1024)
+        check = lambda: isinstance(json.loads(body).get('text'), str)
+    if status in (400, 401, 402, 403, 429):
+        raise Inconclusive(f'gateway_{status}')
+    if status != 200:
+        raise Blocked('Miner or route failure')
+    try:
+        ok = check()
+    except ValueError:
+        ok = False
+    if not ok:
+        raise Blocked('Nonconforming output')
+    return latency
+
+
+def video_submit(c, offer):
+    """Starts a short, cheapest-resolution video probe; returns a task reference."""
+    status, body, _ = fetch(c, 'POST', '/v1/videos', {
+        'Authorization': 'Bearer ' + api_key(c), 'Content-Type': 'application/json', 'X-Terza-Offer': offer.offer_id},
+        json.dumps({'model': offer.model, 'prompt': secrets.choice(MEDIA_PROMPTS[:2]), 'resolution': offer.resolution,
+                    'seconds': VIDEO_PROBE_SECONDS}), deadline=60)
+    if status in (400, 401, 402, 403, 429):
+        raise Inconclusive(f'gateway_{status}')
+    if status != 202:
+        raise Blocked('Miner or route failure')
+    return 'video:' + json.loads(body)['id']
+
+
+def video_status(c, video_id):
+    """Maps the gateway video job to the media-task shape used by media_finalize."""
+    status, body, _ = fetch(c, 'GET', f'/v1/videos/{video_id}', {'Authorization': 'Bearer ' + api_key(c)})
+    if status != 200:
+        raise Inconclusive(f'gateway_{status}')
+    v = json.loads(body)
+    if v.get('status') == 'completed':
+        return {'status': 'succeeded', 'created_at': v.get('created_at'), 'completed_at': v.get('completed_at')}
+    if v.get('status') == 'failed':
+        return {'status': 'failed', 'error': {'code': 'miner_failed'}}
+    if v.get('status') == 'expired':
+        return {'status': 'expired'}
+    return {'status': 'running'}
 
 
 class Evidence:
@@ -547,7 +668,7 @@ class Evidence:
 
     def media_submit(self, offer, round_id, submit):
         """Records a pending media probe; finalized by media_finalize in later rounds."""
-        plan = media_plan(offer.media)
+        plan = media_plan(offer.media) if offer.kind == 'media' else {'operation': offer.kind}
         ident = digest([offer.fingerprint, round_id, secrets.token_hex(8)])
         with self.lock:
             self.db.execute("INSERT INTO samples(challenge,round,fingerprint,family,started,tier,subject,status) VALUES(?,?,?,?,?,'media',?,'pending')",
@@ -601,11 +722,26 @@ class Evidence:
             "SELECT * FROM samples WHERE subject=? AND tier='media' AND started>? AND status NOT IN ('pending','inconclusive')",
             (subject, time.time() - MEDIA_WINDOW_DAYS * 86400))]
 
-    def media_due(self, subject, rng=secrets.SystemRandom()):
+    def unit_sample(self, offer, round_id, run):
+        """Records a synchronous unit probe (image, speech, transcription) as media evidence."""
+        ident = digest([offer.fingerprint, round_id, secrets.token_hex(8)])
+        with self.lock:
+            self.db.execute("INSERT INTO samples(challenge,round,fingerprint,family,started,tier,subject,status) VALUES(?,?,?,?,?,'media',?,'pending')",
+                            (ident, round_id, offer.fingerprint, offer.kind, time.time(), offer.subject))
+            self.db.commit()
+        try:
+            latency = run(offer)
+            self._finish(ident, 1, 1, latency, 'passed')
+        except Inconclusive:
+            self._finish(ident, 0, 0, 20, 'inconclusive')
+        except Exception:
+            self._finish(ident, 0, 0, 20, 'transport_or_protocol_failure')
+
+    def media_due(self, subject, rng=secrets.SystemRandom(), per_day=MEDIA_PROBES_PER_DAY):
         if self.db.execute("SELECT 1 FROM samples WHERE subject=? AND tier='media' AND status='pending'", (subject,)).fetchone():
             return False
         last = self.db.execute("SELECT max(started) FROM samples WHERE subject=? AND tier='media'", (subject,)).fetchone()[0]
-        return last is None or time.time() - last >= 86400 / MEDIA_PROBES_PER_DAY * (0.5 + rng.random())
+        return last is None or time.time() - last >= 86400 / per_day * (0.5 + rng.random())
 
     def hard_due(self, subject, rng=secrets.SystemRandom()):
         last = self.db.execute("SELECT max(started) FROM samples WHERE subject=? AND tier='hard'", (subject,)).fetchone()[0]
@@ -692,12 +828,12 @@ def capability(samples, profile):
     return 1., {**metrics, 'capability': 'consistent'}
 
 
-def media_score(samples, stats):
+def media_score(samples, stats, fresh_hours=MEDIA_FRESH_HOURS):
     """Availability × conformance × latency for media offers; no automated quality grading."""
     n = len(samples)
     if n < MEDIA_MIN_SAMPLES:
         return 0., {'reason': 'insufficient_media_samples', 'media_samples': n}
-    if max(s['started'] for s in samples) < time.time() - MEDIA_FRESH_HOURS * 3600:
+    if max(s['started'] for s in samples) < time.time() - fresh_hours * 3600:
         return 0., {'reason': 'stale_evidence', 'media_samples': n}
     availability = sum(s['ok'] for s in samples) / n
     succeeded, nonconforming = int(stats.get('succeeded', 0)), int(stats.get('nonconforming', 0))
@@ -723,8 +859,9 @@ def weights(offers, evidence, models, profiles=None, window=3600, fresh=300):
         if o.uid is None or o.expires <= time.time():
             continue
         factor, observed = organic(o.stats)
-        if o.kind == 'media':
-            value, metrics = media_score(evidence.media(o.subject), o.stats)
+        if o.kind != 'text':
+            value, metrics = media_score(evidence.media(o.subject), o.stats,
+                                         VIDEO_FRESH_HOURS if o.kind == 'video' else MEDIA_FRESH_HOURS)
             cap_factor, cap_metrics = 1., {}
         else:
             value, metrics = score(evidence.recent(o.fingerprint, window), fresh)
@@ -735,7 +872,7 @@ def weights(offers, evidence, models, profiles=None, window=3600, fresh=300):
         gate = None
         if value <= 0:
             gate = metrics.get('reason', 'below_quality')
-        elif o.kind != 'media' and metrics.get('availability', 0) < MIN_AVAILABILITY:
+        elif o.kind == 'text' and metrics.get('availability', 0) < MIN_AVAILABILITY:
             gate = 'below_availability'
         elif factor <= 0 or (observed.get('organic') == 'observed' and factor < MIN_ORGANIC_SUCCESS):
             gate = 'organic_failures'
@@ -861,7 +998,7 @@ async def run(c, ev, submit=False):
         round_id = secrets.token_hex(16)
         await asyncio.to_thread(ev.media_finalize, lambda task: media_status(c, task))
         text = [o for o in offers if o.kind == 'text']
-        media = [o for o in offers if o.kind == 'media' and ev.media_due(o.subject)]
+        media = [o for o in offers if o.kind != 'text' and ev.media_due(o.subject, per_day=probes_per_day(o))]
         # Offers due for a basic probe, the longest-unprobed first, within the round budget.
         interval = probe_interval(c)
         jitter = secrets.SystemRandom()
@@ -872,11 +1009,11 @@ async def run(c, ev, submit=False):
         due = {o.offer_id for o in text if ev.hard_due(o.subject)}
         budget, spent, chosen = float(c.get('round_budget_usd', DEFAULT_ROUND_BUDGET_USD)), 0., []
         for o in media + text:
-            cost = o.cost if o.kind == 'media' else o.cost * len(FAMILIES) + (o.hard_cost if o.offer_id in due else 0)
+            cost = o.cost if o.kind != 'text' else o.cost * len(FAMILIES) + (o.hard_cost if o.offer_id in due else 0)
             if spent + cost <= budget:
                 chosen.append(o)
                 spent += cost
-        media = [o for o in chosen if o.kind == 'media']
+        media = [o for o in chosen if o.kind != 'text']
         probed = chosen
         secrets.SystemRandom().shuffle(probed)
         semaphore = asyncio.Semaphore(4)
@@ -884,9 +1021,14 @@ async def run(c, ev, submit=False):
         miner_locks = {o.hotkey: asyncio.Lock() for o in probed}
         async def evaluate(o):
             async with miner_locks[o.hotkey], semaphore:
-                if o.kind == 'media':
+                if o.kind != 'text':
                     if o in media:
-                        await asyncio.to_thread(ev.media_submit, o, round_id, lambda off, plan: media_submit(c, off, plan))
+                        if o.kind == 'media':
+                            await asyncio.to_thread(ev.media_submit, o, round_id, lambda off, plan: media_submit(c, off, plan))
+                        elif o.kind == 'video':
+                            await asyncio.to_thread(ev.media_submit, o, round_id, lambda off, plan: video_submit(c, off))
+                        else:
+                            await asyncio.to_thread(ev.unit_sample, o, round_id, lambda off: unit_run(c, off))
                     return
                 families = list(FAMILIES)
                 if o.offer_id in due:
