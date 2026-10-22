@@ -78,16 +78,45 @@ class ValidatorTests(unittest.TestCase):
         a.expires=time.time()-1
         self.assertEqual(weights([a],E(),['model'])[0],{})
 
-    def test_model_budget_and_price_bounded(self):
+    def test_price_decides_after_gates(self):
+        class E:
+            def __init__(self, slow=()): self.slow=slow
+            def recent(self,f):
+                rows=samples()
+                if f in self.slow:
+                    for row in rows[:2]: row['available']=0
+                return rows
+            def hard(self,s): return []
+        def priced(h, factor):
+            o=offer(h); o.input_price*=factor; o.output_price*=factor; return o
+        a,b,c=priced('a',1),priced('b',.5),priced('c',2)
+        result,details=weights([a,b,c],E(),['model'])
+        # Median-priced = 1, half price = 2, double price = 0.5: the cheapest earns 4x the dearest.
+        self.assertAlmostEqual(result['b']/result['c'],4)
+        self.assertAlmostEqual(result['a']/result['c'],2)
+        self.assertAlmostEqual(sum(result.values()),1)
+        self.assertTrue(all(d['gate']=='passed' for d in details))
+        # A cheaper offer below the availability bar earns nothing.
+        d=priced('d',.1)
+        result,details=weights([a,b,c,d],E(slow={d.fingerprint}),['model'])
+        self.assertNotIn('d',result)
+        self.assertEqual({x['hotkey']:x['gate'] for x in details}['d'],'below_availability')
+        # Dumping is capped: a near-free quote earns at most 3x a median-priced one.
+        e=priced('e',.0001)
+        result,_=weights([a,e,c],E(),['model'])
+        self.assertAlmostEqual(result['e']/result['a'],3)
+        # Unselected models must not enter the reward allocation.
+        result,_=weights([a,offer('b','unselected')],E(),['model'])
+        self.assertEqual(result,{'a':1})
+
+    def test_organic_success_is_a_gate(self):
         class E:
             def recent(self,f): return samples()
             def hard(self,s): return []
-        a=offer('a'); b=offer('b'); b.input_price=b.output_price=.0000001
-        result,_=weights([a,b],E(),['model'])
-        self.assertLess(result['b']/result['a'],1.34)
-        self.assertAlmostEqual(sum(result.values()),1)
-        # Unselected models must not enter the reward allocation.
-        result,_=weights([a,offer('b','unselected')],E(),['model'])
+        good=offer('a',stats={'requests':100,'succeeded':95,'miner_failed':5})
+        weak=offer('b',stats={'requests':100,'succeeded':80,'miner_failed':20})
+        weak.input_price=weak.output_price=.0001
+        result,_=weights([good,weak],E(),['model'])
         self.assertEqual(result,{'a':1})
 
     def test_private_destination_rejected(self):

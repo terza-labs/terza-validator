@@ -27,8 +27,8 @@ registered validator hotkey and a funded Terza API key can run it.
   recorded as `inconclusive` and never count against a miner. 502 and
   `offer_unavailable` 503 count as availability failures.
 - **Organic traffic:** the directory includes 24-hour gateway statistics per offer.
-  Rejected usage receipts above 1% of requests zero the offer's score; with at least
-  20 attributable requests, the score is multiplied by the organic success rate.
+  Rejected usage receipts above 1% of requests, or a success rate below 90% once there
+  are at least 20 attributable requests, fail the offer (see Scoring).
   These statistics come from the gateway; probe results are measured independently.
 - **Usage-weighted rewards (prepared, disabled):** `USAGE_WEIGHT = 0`, so rewards
   depend only on probe quality. Enabling it is a scoring change with a `VERSION` bump.
@@ -51,8 +51,8 @@ differences, k-th smallest, base 7, multi-step state chains, Caesar decoding) ar
 mixed into normal rounds. They are graded exactly, tracked per hotkey and model for
 three days, and compared with `reference_profiles.json`:
 
-- accuracy whose 95% upper bound is more than 0.15 below the reference → score 0;
-- median reasoning tokens more than 3× above or below the reference → score halved;
+- accuracy whose 95% upper bound is more than 0.15 below the reference → fails the gate;
+- median reasoning tokens more than 3× above or below the reference → share halved;
 - fewer than 20 answered hard probes, or no reference profile → no effect.
 
 Reference profiles are calibrated from a trusted source with `calibrate.py`, never
@@ -60,22 +60,34 @@ from miners. Changing a profile requires a `VERSION` bump.
 
 **Media offers** are scored on availability and output conformance, not automated
 quality. About 6 paid probes per offer per day use the cheapest settings the offer
-declares. Score = availability × conformance × 1/(1 + median seconds/300), zero below
-90% for either.
+declares. Availability and conformance must each be at least 90%; passing media
+offers then compete on price like text offers.
 
-### Scoring
+### Scoring (version 5): quality gates, then price
 
-Scoring needs ≥ 9 samples from ≥ 3 rounds, ≥ 3 samples per task family, and recent
-evidence (within the last hour, with a sample in the last five minutes). Accuracy
-below 75% scores zero. The base score is:
+An offer must pass **every** gate. Passing a gate earns no extra reward; failing any
+gate scores zero.
 
-`Wilson95LowerBound(accuracy)^2 * availability / (1 + median_latency_seconds/5)`
+- At least 9 samples from 3 rounds, 3 per task family, with a sample in the last
+  five minutes.
+- Accuracy of at least 75%.
+- Availability of at least 90%.
+- No usage-receipt fraud (rejections above 1% of requests), and at least 90% success
+  on observed buyer traffic once there are 20 attributable requests.
+- Hard-probe accuracy not clearly below the model's reference profile.
+- Media offers: availability and output conformance of at least 90%.
 
-Within each model cohort, price applies a bounded multiplier
-`0.75 + 0.25 * median_quote / (median_quote + quote)`, using a standard 512-input /
-128-output token workload. Cohorts have equal budgets; only cohorts with qualified
-supply allocate rewards. Quote changes invalidate older evidence. Expired, paused,
-suspended, unapproved or unregistered offers and your own hotkey are excluded.
+Passing offers in a model cohort then share the cohort's budget **by price alone**.
+Each offer's share is proportional to `min(median_quote / quote, 3)`: a median-priced
+offer counts 1, a half-price offer 2, a double-price offer 0.5. The cap means quoting
+below a third of the median earns nothing further. Quotes use a standard 512-input /
+128-output token workload and are binding: the gateway charges buyers the quoted price
+and routes them to the cheapest eligible offer. A reasoning-profile mismatch
+(substitution suspicion) halves an offer's share.
+
+Cohorts have equal budgets; only cohorts with passing supply allocate rewards. Quote
+changes invalidate older evidence. Expired, paused, suspended, unapproved or
+unregistered offers and your own hotkey are excluded.
 
 Bounds per round: at most 16 benchmark offers and USD 1 of quoted benchmark cost.
 

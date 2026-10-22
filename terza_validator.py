@@ -28,7 +28,15 @@ from urllib.parse import urlsplit
 
 ENDPOINT = 'wss://test.finney.opentensor.ai:443'
 GENESIS = '0x8f9cf856bf558a14440e75569c9e58594757048d7b3a84b5d25f6bd978263105'
-VERSION = 4
+VERSION = 5
+# Scoring (version 5): an offer must pass every quality gate; passing offers in a model
+# cohort then share its budget by price alone. Cheaper quotes earn more, up to
+# PRICE_ADVANTAGE_CAP times the share of a median-priced offer, so below-cost dumping
+# gains nothing further. Quotes are binding: the gateway charges buyers the quoted price
+# and routes them to the cheapest eligible offer.
+MIN_AVAILABILITY = 0.9
+MIN_ORGANIC_SUCCESS = 0.9
+PRICE_ADVANTAGE_CAP = 3.0
 # Future usage-weighted rewards. DISABLED: rewards currently depend only on probe
 # quality. Enabling is a scoring change: raise USAGE_WEIGHT (<= USAGE_WEIGHT_MAX)
 # and bump VERSION. Only buyer spend from other accounts counts (the gateway
@@ -652,6 +660,13 @@ def media_score(samples, stats):
     return availability * conformance / (1 + latency / 300), metrics
 
 
+def price_share(cost, reference):
+    """Relative price score: median-priced = 1, half price = 2, capped at PRICE_ADVANTAGE_CAP."""
+    if cost <= 0:
+        return PRICE_ADVANTAGE_CAP
+    return min(reference / cost, PRICE_ADVANTAGE_CAP)
+
+
 def weights(offers, evidence, models, profiles=None):
     by_model, details = {}, []
     for o in offers:
@@ -665,19 +680,29 @@ def weights(offers, evidence, models, profiles=None):
             value, metrics = score(evidence.recent(o.fingerprint))
             cap_factor, cap_metrics = capability(evidence.hard(o.subject), (profiles if profiles is not None
                                                                            else reference_profiles()).get(o.model))
-        value *= factor * cap_factor
         metrics = {**metrics, **observed, **cap_metrics}
+        # Quality gates: pass/fail only. Speed and accuracy above the bar do not add reward.
+        gate = None
+        if value <= 0:
+            gate = metrics.get('reason', 'below_quality')
+        elif o.kind != 'media' and metrics.get('availability', 0) < MIN_AVAILABILITY:
+            gate = 'below_availability'
+        elif factor <= 0 or (observed.get('organic') == 'observed' and factor < MIN_ORGANIC_SUCCESS):
+            gate = 'organic_failures'
+        elif cap_factor <= 0:
+            gate = 'below_reference'
+        metrics['gate'] = gate or 'passed'
         details.append({'hotkey': o.hotkey, 'uid': o.uid, 'model': o.model, **metrics})
-        if value > 0:
-            by_model.setdefault(o.model, []).append((o, value))
+        if not gate:
+            # A reasoning-profile mismatch (substitution suspicion) still halves the share.
+            by_model.setdefault(o.model, []).append((o, cap_factor))
     result = {}
     for model in models:
         group = by_model.get(model, [])
         if not group:
             continue
-        # Bounded price influence: a fabricated near-zero price cannot dominate quality.
         reference = statistics.median(o.cost for o, _ in group)
-        values = [(o, v * (.75 + .25 * reference / (reference + o.cost))) for o, v in group]
+        values = [(o, penalty * price_share(o.cost, reference)) for o, penalty in group]
         total = sum(v for _, v in values)
         for o, v in values:
             result[o.hotkey] = result.get(o.hotkey, 0) + v / total / len(models)
