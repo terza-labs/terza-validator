@@ -43,7 +43,8 @@ Every request carries a random 96-bit nonce; only exact JSON with the correct
 nonce, answer, model label and a completed finish reason passes. At most four offers
 run concurrently, and requests to one hotkey are serialized. HTTPS addresses are
 resolved, checked for public IPs and pinned per request; redirects and environment
-proxies are not used.
+proxies are not used. Each probe has a 60-second deadline (hard probes 120 seconds),
+so occasionally slow reasoning responses are not counted as failures.
 
 **Model-substitution checks.** About 40 hard probes per offer per day (large
 multiplication, modular exponentiation, letter counting, string reversal, date
