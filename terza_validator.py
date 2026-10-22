@@ -43,6 +43,9 @@ VERSION = 5
 MIN_AVAILABILITY = 0.9
 # Reasoning models occasionally take 20+ seconds; a probe fails only after this deadline.
 PROBE_DEADLINE = 60
+# Reasoning models spend hidden tokens before answering; too small a limit truncates the
+# answer (finish_reason 'length') and would fail a correct model.
+BASIC_MAX_TOKENS = 1024
 MIN_ORGANIC_SUCCESS = 0.9
 PRICE_ADVANTAGE_CAP = 3.0
 # Each text offer is probed (one task per family) about once per interval, so cost grows
@@ -497,7 +500,7 @@ class Evidence:
                              'hard' if hard else 'basic', offer.subject))
             self.db.commit()  # crashes are failures, never missing successes
         payload = {'model': offer.model, 'messages': [{'role': 'user', 'content': prompt}], 'temperature': 0,
-                   'max_tokens': min(offer.max_output, HARD_MAX_TOKENS) if hard else 128, 'stream': False}
+                   'max_tokens': min(offer.max_output, HARD_MAX_TOKENS if hard else BASIC_MAX_TOKENS), 'stream': False}
         completion = reasoning = None
         try:
             result, latency = send(offer, payload, HARD_DEADLINE if hard else PROBE_DEADLINE)
