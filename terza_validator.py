@@ -35,6 +35,8 @@ VERSION = 5
 # gains nothing further. Quotes are binding: the gateway charges buyers the quoted price
 # and routes them to the cheapest eligible offer.
 MIN_AVAILABILITY = 0.9
+# Reasoning models occasionally take 20+ seconds; a probe fails only after this deadline.
+PROBE_DEADLINE = 60
 MIN_ORGANIC_SUCCESS = 0.9
 PRICE_ADVANTAGE_CAP = 3.0
 # Future usage-weighted rewards. DISABLED: rewards currently depend only on probe
@@ -387,7 +389,7 @@ def api_key(c):
     return key
 
 
-def probe(c, offer, payload, deadline=20):
+def probe(c, offer, payload, deadline=PROBE_DEADLINE):
     """Paid buyer request pinned to one offer. Gateway-side refusals are inconclusive."""
     status, body, latency = fetch(c, 'POST', '/v1/chat/completions', {
         'Authorization': 'Bearer ' + api_key(c), 'Content-Type': 'application/json',
@@ -458,7 +460,7 @@ class Evidence:
                    'max_tokens': min(offer.max_output, HARD_MAX_TOKENS) if hard else 128, 'stream': False}
         completion = reasoning = None
         try:
-            result, latency = send(offer, payload, HARD_DEADLINE if hard else 20)
+            result, latency = send(offer, payload, HARD_DEADLINE if hard else PROBE_DEADLINE)
             usage = result.get('usage') or {}
             completion = usage.get('completion_tokens')
             reasoning = (usage.get('completion_tokens_details') or {}).get('reasoning_tokens', 0)
