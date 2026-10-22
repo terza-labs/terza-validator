@@ -45,6 +45,36 @@ MIN_AVAILABILITY = 0.9
 PROBE_DEADLINE = 60
 MIN_ORGANIC_SUCCESS = 0.9
 PRICE_ADVANTAGE_CAP = 3.0
+# Each text offer is probed (one task per family) about once per interval, so cost grows
+# with the number of offers, not with the number of rounds. A round never spends more than
+# the round budget; offers that do not fit wait for the next round, oldest first.
+DEFAULT_PROBE_INTERVAL_MINUTES = 10
+DEFAULT_ROUND_BUDGET_USD = 1.0
+MAX_OFFERS = 500
+
+
+def probe_interval(c):
+    return 60 * float(c.get('probe_interval_minutes', DEFAULT_PROBE_INTERVAL_MINUTES))
+
+
+def evidence_window(c):
+    # Must hold at least three probe rounds for the scoring gates.
+    return max(3600, 4 * probe_interval(c))
+
+
+def freshness(c):
+    return 2 * probe_interval(c)
+
+
+def rewards_all_models(c):
+    return c.get('models') in ('*', ['*'])
+
+
+def cohorts(c, offers):
+    """Reward cohorts: the private model list, or every admitted model for '*'."""
+    if rewards_all_models(c):
+        return sorted({o.model for o in offers})
+    return c['models']
 # Future usage-weighted rewards. DISABLED: rewards currently depend only on probe
 # quality. Enabling is a scoring change: raise USAGE_WEIGHT (<= USAGE_WEIGHT_MAX)
 # and bump VERSION. Only buyer spend from other accounts counts (the gateway
@@ -108,8 +138,12 @@ def validate_config(c):
     if c.get('network') not in NETWORKS or not isinstance(c.get('netuid'), int) or not 1 <= c['netuid'] <= 65535:
         raise Blocked('Explicit network (finney or test) and registered netuid required')
     models = c.get('models', [])
-    if not models or len(models) > 20 or len(set(models)) != len(models):
-        raise Blocked('Select 1..20 unique benchmark model IDs')
+    if not rewards_all_models(c) and (not models or len(models) > MAX_OFFERS or len(set(models)) != len(models)):
+        raise Blocked('Set models to "*" or a list of unique benchmark model IDs')
+    if not 1 <= float(c.get('probe_interval_minutes', DEFAULT_PROBE_INTERVAL_MINUTES)) <= 60:
+        raise Blocked('probe_interval_minutes must be 1..60')
+    if not 0 < float(c.get('round_budget_usd', DEFAULT_ROUND_BUDGET_USD)) <= 20:
+        raise Blocked('round_budget_usd must be above 0 and at most 20')
     keys = c.get('gateway_public_keys', [])
     if not 1 <= len(keys) <= 8 or not all(isinstance(k, str) and len(k) == 64 for k in keys):
         raise Blocked('Pin 1..8 gateway public keys (hex)')
@@ -240,7 +274,7 @@ def parse_offers(data, c):
     offers, seen = [], set()
     for m in data.get('offers', []):
         model = m.get('model_id')
-        if model not in c['models'] or (m['hotkey'], model) in seen:
+        if (not rewards_all_models(c) and model not in c['models']) or (m['hotkey'], model) in seen:
             continue
         if 'media' in m.get('protocols', []) and m.get('media'):
             expiry = dt.datetime.fromisoformat(m['quote_valid_until'].replace('Z', '+00:00')).timestamp()
@@ -261,8 +295,8 @@ def parse_offers(data, c):
         seen.add((m['hotkey'], model))
         offers.append(Offer(m['offer_id'], m['hotkey'], model, a, b, expiry, stats=m.get('stats_24h', {}),
                             max_output=int(m['max_output_tokens'])))
-    if len(offers) > 16:
-        raise Blocked('Pilot limit: at most 16 approved benchmark offers')
+    if len(offers) > MAX_OFFERS:
+        raise Blocked(f'At most {MAX_OFFERS} benchmark offers')
     return offers
 
 
@@ -492,10 +526,15 @@ class Evidence:
         self.db.execute('INSERT OR IGNORE INTO identity VALUES(?)', (identity,))
         self.db.commit()
 
-    def recent(self, fingerprint):
+    def recent(self, fingerprint, window=3600):
         return [dict(r) for r in self.db.execute(
             "SELECT * FROM samples WHERE fingerprint=? AND started>? AND status<>'inconclusive' AND tier='basic' ORDER BY started DESC LIMIT 90",
-            (fingerprint, time.time() - 3600))]
+            (fingerprint, time.time() - window))]
+
+    def last_basic(self, fingerprint):
+        """Start time of the latest basic probe for an offer, or None."""
+        row = self.db.execute("SELECT max(started) FROM samples WHERE fingerprint=? AND tier='basic'", (fingerprint,)).fetchone()
+        return row[0] if row else None
 
     def hard(self, subject):
         """Answered hard probes in the window; transport failures carry no capability signal."""
@@ -571,13 +610,13 @@ class Evidence:
         return last is None or time.time() - last >= 86400 / HARD_PER_DAY * (0.5 + rng.random())
 
 
-def score(samples):
+def score(samples, fresh=300):
     # Nine independent challenges across >=3 rounds; all three skill families required.
     if len(samples) < 9 or len({s['round'] for s in samples}) < 3:
         return 0., {'reason': 'insufficient_samples'}
     if any(sum(s['family'] == f for s in samples) < 3 for f in FAMILIES):
         return 0., {'reason': 'incomplete_coverage'}
-    if max(s['started'] for s in samples) < time.time() - 300:
+    if max(s['started'] for s in samples) < time.time() - fresh:
         return 0., {'reason': 'stale_evidence'}
     n = len(samples)
     p = sum(s['ok'] for s in samples) / n
@@ -675,7 +714,7 @@ def price_share(cost, reference):
     return min(reference / cost, PRICE_ADVANTAGE_CAP)
 
 
-def weights(offers, evidence, models, profiles=None):
+def weights(offers, evidence, models, profiles=None, window=3600, fresh=300):
     by_model, details = {}, []
     for o in offers:
         if o.uid is None or o.expires <= time.time():
@@ -685,7 +724,7 @@ def weights(offers, evidence, models, profiles=None):
             value, metrics = media_score(evidence.media(o.subject), o.stats)
             cap_factor, cap_metrics = 1., {}
         else:
-            value, metrics = score(evidence.recent(o.fingerprint))
+            value, metrics = score(evidence.recent(o.fingerprint, window), fresh)
             cap_factor, cap_metrics = capability(evidence.hard(o.subject), (profiles if profiles is not None
                                                                            else reference_profiles()).get(o.model))
         metrics = {**metrics, **observed, **cap_metrics}
@@ -820,13 +859,26 @@ async def run(c, ev, submit=False):
         await asyncio.to_thread(ev.media_finalize, lambda task: media_status(c, task))
         text = [o for o in offers if o.kind == 'text']
         media = [o for o in offers if o.kind == 'media' and ev.media_due(o.subject)]
+        # Offers due for a basic probe, the longest-unprobed first, within the round budget.
+        interval = probe_interval(c)
+        jitter = secrets.SystemRandom()
+        last = {o.offer_id: ev.last_basic(o.fingerprint) for o in text}
+        text = sorted((o for o in text if last[o.offer_id] is None
+                       or time.time() - last[o.offer_id] >= interval * (0.8 + 0.4 * jitter.random())),
+                      key=lambda o: last[o.offer_id] or 0)
         due = {o.offer_id for o in text if ev.hard_due(o.subject)}
-        if sum(o.cost * len(FAMILIES) + (o.hard_cost if o.offer_id in due else 0) for o in text) + sum(o.cost for o in media) > 1:
-            raise Blocked('Pilot benchmark budget exceeds USD 1 per round')
-        secrets.SystemRandom().shuffle(offers)
+        budget, spent, chosen = float(c.get('round_budget_usd', DEFAULT_ROUND_BUDGET_USD)), 0., []
+        for o in media + text:
+            cost = o.cost if o.kind == 'media' else o.cost * len(FAMILIES) + (o.hard_cost if o.offer_id in due else 0)
+            if spent + cost <= budget:
+                chosen.append(o)
+                spent += cost
+        media = [o for o in chosen if o.kind == 'media']
+        probed = chosen
+        secrets.SystemRandom().shuffle(probed)
         semaphore = asyncio.Semaphore(4)
         send = lambda o, payload, deadline: probe(c, o, payload, deadline)
-        miner_locks = {o.hotkey: asyncio.Lock() for o in offers}
+        miner_locks = {o.hotkey: asyncio.Lock() for o in probed}
         async def evaluate(o):
             async with miner_locks[o.hotkey], semaphore:
                 if o.kind == 'media':
@@ -840,10 +892,10 @@ async def run(c, ev, submit=False):
                 for family in families:
                     if o.expires > time.time():
                         await asyncio.to_thread(ev.sample, o, family, round_id, send)
-        await asyncio.gather(*(evaluate(o) for o in offers))
+        await asyncio.gather(*(evaluate(o) for o in probed))
         current = {o.fingerprint for o in load_offers(c)}
         offers = [o for o in offers if o.fingerprint in current]
-        scores, metrics = weights(offers, ev, c['models'])
+        scores, metrics = weights(offers, ev, cohorts(c, offers), window=evidence_window(c), fresh=freshness(c))
         report = {'network': c['network'], 'netuid': c['netuid'], 'version': VERSION,
                   'block': chain.block_hash, 'weights': scores, 'metrics': metrics,
                   'model_provenance': 'not_proven', 'status': 'evaluation_only'}
@@ -868,7 +920,7 @@ async def run(c, ev, submit=False):
         fresh = {o.fingerprint for o in load_offers(c)}
         if any(o.fingerprint not in fresh for o in offers):
             raise Blocked('Supply changed during preview; reevaluate')
-        current_scores, _ = weights(offers, ev, c['models'])
+        current_scores, _ = weights(offers, ev, cohorts(c, offers), window=evidence_window(c), fresh=freshness(c))
         if current_scores != scores:
             raise Blocked('Evidence expired during preview; reevaluate')
         await chain.preflight(c['validator_hotkey'], scores, offers)

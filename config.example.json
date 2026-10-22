@@ -1,9 +1,7 @@
 {
   "network": "finney",
   "netuid": 103,
-  "models": [
-    "REPLACE_WITH_BENCHMARK_MODEL_ID"
-  ],
+  "models": "*",
   "gateway_url": "https://terza.si",
   "gateway_public_keys": [
     "REPLACE_WITH_PUBLIC_KEY_FROM_/api/public/gateway-identity"
@@ -14,5 +12,7 @@
   "wallet_name": "your-wallet",
   "wallet_hotkey": "your-validator-hotkey",
   "wallet_path": "/home/validator/.bittensor/wallets",
-  "password_file": "/etc/terza-validator/hotkey-password.json"
+  "password_file": "/etc/terza-validator/hotkey-password.json",
+  "probe_interval_minutes": 10,
+  "round_budget_usd": 1.0
 }

@@ -68,8 +68,8 @@ offers then compete on price like text offers.
 An offer must pass **every** gate. Passing a gate earns no extra reward; failing any
 gate scores zero.
 
-- At least 9 samples from 3 rounds, 3 per task family, with a sample in the last
-  five minutes.
+- At least 9 samples in the evidence window from 3 rounds, 3 per task family, with a
+  sample within two probe intervals (20 minutes by default).
 - Accuracy of at least 75%.
 - Availability of at least 90%.
 - No usage-receipt fraud (rejections above 1% of requests), and at least 90% success
@@ -85,11 +85,14 @@ below a third of the median earns nothing further. Quotes use a standard 512-inp
 and routes them to the cheapest eligible offer. A reasoning-profile mismatch
 (substitution suspicion) halves an offer's share.
 
-Cohorts have equal budgets; only cohorts with passing supply allocate rewards. Quote
+Each offer is probed about once per `probe_interval_minutes` (default 10), and a round
+never spends more than `round_budget_usd` (default 1); offers that do not fit wait for
+the next round, oldest first. Set `models` to `"*"` to reward every model in the
+directory, or to a list of model IDs. Each model is a cohort with an equal budget; only
+cohorts with passing supply allocate rewards. Quote
 changes invalidate older evidence. Expired, paused, suspended, unapproved or
 unregistered offers and your own hotkey are excluded.
 
-Bounds per round: at most 16 benchmark offers and USD 1 of quoted benchmark cost.
 
 Evidence is kept in a private SQLite database in `state_dir`. No bearer token,
 upstream origin or customer content is written to reports. An exclusive lock

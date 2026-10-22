@@ -72,7 +72,7 @@ class ValidatorTests(unittest.TestCase):
         a=offer(); b=dataclasses.replace(a,offer_id='admitted_miner_2_0')
         self.assertNotEqual(a.fingerprint,b.fingerprint)
         class E:
-            def recent(self,f): return samples() if f==a.fingerprint else []
+            def recent(self,f,window=3600): return samples() if f==a.fingerprint else []
             def hard(self,s): return []
         self.assertEqual(weights([b],E(),['model'])[0],{})
         a.expires=time.time()-1
@@ -81,7 +81,7 @@ class ValidatorTests(unittest.TestCase):
     def test_price_decides_after_gates(self):
         class E:
             def __init__(self, slow=()): self.slow=slow
-            def recent(self,f):
+            def recent(self,f,window=3600):
                 rows=samples()
                 if f in self.slow:
                     for row in rows[:2]: row['available']=0
@@ -115,9 +115,38 @@ class ValidatorTests(unittest.TestCase):
         with self.assertRaises(ValueError): validate_config({**CONFIG,'network':'local'})
         self.assertNotEqual(NETWORKS['finney'][1], NETWORKS['test'][1])
 
+    def test_all_models_and_private_list(self):
+        from terza_validator import parse_offers, cohorts, validate_config
+        def m(h, model):
+            return {'offer_id':f'admitted_{h}_1_0','hotkey':h,'model_id':model,'protocols':['chat'],
+                    'input_price_per_m':'1','output_price_per_m':'2','max_input_tokens':4096,'max_output_tokens':1024,
+                    'quote_valid_until':'2999-01-01T00:00:00Z'}
+        data={'offers':[m('a','gpt-6.1-sol'),m('b','claude-opus-5'),m('c','kimi-k3')]}
+        everything={**CONFIG,'models':'*'}
+        validate_config(everything)
+        offers=parse_offers(data,everything)
+        self.assertEqual(sorted(o.model for o in offers),['claude-opus-5','gpt-6.1-sol','kimi-k3'])
+        self.assertEqual(cohorts(everything,offers),['claude-opus-5','gpt-6.1-sol','kimi-k3'])
+        # A private list still limits rewards to the listed models.
+        self.assertEqual([o.model for o in parse_offers(data,{**CONFIG,'models':['kimi-k3']})],['kimi-k3'])
+        # Each cohort earns an equal budget; a hotkey sums its cohorts.
+        for i,o in enumerate(offers): o.uid=i+1
+        class E:
+            def recent(self,f,window=3600): return samples()
+            def hard(self,s): return []
+        result,_=weights(offers,E(),cohorts(everything,offers))
+        self.assertAlmostEqual(result['a'],1/3); self.assertAlmostEqual(result['b'],1/3)
+
+    def test_freshness_follows_probe_interval(self):
+        from terza_validator import score
+        old=samples()
+        for row in old: row['started']=time.time()-900
+        self.assertEqual(score(old)[1]['reason'],'stale_evidence')
+        self.assertGreater(score(old,fresh=1200)[0],0)
+
     def test_organic_success_is_a_gate(self):
         class E:
-            def recent(self,f): return samples()
+            def recent(self,f,window=3600): return samples()
             def hard(self,s): return []
         good=offer('a',stats={'requests':100,'succeeded':95,'miner_failed':5})
         weak=offer('b',stats={'requests':100,'succeeded':80,'miner_failed':20})
@@ -269,7 +298,7 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(organic({'requests':100,'succeeded':98,'usage_rejected':2})[0],0)
         self.assertAlmostEqual(organic({'requests':100,'succeeded':90,'miner_failed':10})[0],.9)
         class E:
-            def recent(self,f): return samples()
+            def recent(self,f,window=3600): return samples()
             def hard(self,s): return []
         result,_=weights([offer('a'),offer('b',stats={'requests':100,'succeeded':50,'usage_rejected':50})],E(),['model'])
         self.assertEqual(result,{'a':1})
