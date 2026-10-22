@@ -1,6 +1,6 @@
 {
-  "network": "test",
-  "netuid": null,
+  "network": "finney",
+  "netuid": 103,
   "models": [
     "REPLACE_WITH_BENCHMARK_MODEL_ID"
   ],

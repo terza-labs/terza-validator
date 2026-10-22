@@ -8,10 +8,9 @@ and can submit weights on chain.
 It needs no database access, no miner credentials and no coldkey. Anyone with a
 registered validator hotkey and a funded Terza API key can run it.
 
-> **Network status:** this release signs on the Bittensor **testnet** only, with the
-> test endpoint and genesis hash pinned. Mainnet support will be added in the release
-> that moves the Terza gateway to mainnet. Until then the validator refuses any
-> other chain.
+> **Networks:** set `"network": "finney"` and `"netuid": 103` for Terza on Bittensor
+> mainnet, or `"test"` for testnet. Each network's endpoint and genesis hash are pinned;
+> the validator refuses any other chain.
 
 ## How it works
 
@@ -121,7 +120,7 @@ Evaluate only (no chain writes):
 Evaluate and submit weights:
 
 ```sh
-.venv/bin/python terza_validator.py --config /etc/terza-validator/validator.json --watch --submit-testnet
+.venv/bin/python terza_validator.py --config /etc/terza-validator/validator.json --watch --submit
 ```
 
 Latest metrics and proposed weights are written to `state_dir/latest.json`.

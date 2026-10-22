@@ -1,4 +1,4 @@
-"""Independent, testnet-only validator. Never import buyer prompts or supplier keys.
+"""Independent Terza validator. Never import buyer prompts or supplier keys.
 
 Reads the gateway's signed public offer directory and probes offers THROUGH the
 gateway with an ordinary buyer API key, so probes are indistinguishable from buyer
@@ -26,8 +26,14 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-ENDPOINT = 'wss://test.finney.opentensor.ai:443'
-GENESIS = '0x8f9cf856bf558a14440e75569c9e58594757048d7b3a84b5d25f6bd978263105'
+# Each network pins its official endpoint and genesis hash; signing is refused on any other chain.
+NETWORKS = {
+    'finney': ('wss://entrypoint-finney.opentensor.ai:443',
+               '0x2f0555cc76fc2840a25a6ea3b9637146806f1f44b090c175ffde2a7e5ab36c03'),
+    'test': ('wss://test.finney.opentensor.ai:443',
+             '0x8f9cf856bf558a14440e75569c9e58594757048d7b3a84b5d25f6bd978263105'),
+}
+GENESIS = NETWORKS['test'][1]  # kept for tests and older tooling
 VERSION = 5
 # Scoring (version 5): an offer must pass every quality gate; passing offers in a model
 # cohort then share its budget by price alone. Cheaper quotes earn more, up to
@@ -99,8 +105,8 @@ def private_json(path):
 
 
 def validate_config(c):
-    if c.get('network') != 'test' or not isinstance(c.get('netuid'), int) or not 1 <= c['netuid'] <= 65535:
-        raise Blocked('Explicit test network and registered netuid required')
+    if c.get('network') not in NETWORKS or not isinstance(c.get('netuid'), int) or not 1 <= c['netuid'] <= 65535:
+        raise Blocked('Explicit network (finney or test) and registered netuid required')
     models = c.get('models', [])
     if not models or len(models) > 20 or len(set(models)) != len(models):
         raise Blocked('Select 1..20 unique benchmark model IDs')
@@ -225,8 +231,8 @@ def verify_directory(document, pinned_keys, c, now=None):
     now = time.time() if now is None else now
     if data.get('scheme') != 'terza-directory-v1' or abs(now - data['generated_at'] / 1000) > DIRECTORY_MAX_AGE:
         raise Blocked('Stale or unknown directory')
-    if data.get('network') != 'test' or data.get('netuid') != c['netuid']:
-        raise Blocked('Gateway and validator test subnet must match')
+    if data.get('network') != c['network'] or data.get('netuid') != c['netuid']:
+        raise Blocked('Gateway and validator network and subnet must match')
     return data
 
 
@@ -478,7 +484,7 @@ class Evidence:
             self.db.commit()
 
     def bind_config(self, c):
-        identity = digest([GENESIS, c['netuid'], c['validator_hotkey'], sorted(c['models']), VERSION])
+        identity = digest([NETWORKS[c['network']][1], c['netuid'], c['validator_hotkey'], sorted(c['models']), VERSION])
         self.db.execute('CREATE TABLE IF NOT EXISTS identity (id TEXT PRIMARY KEY)')
         previous = self.db.execute('SELECT id FROM identity').fetchone()
         if previous and previous[0] != identity:
@@ -744,16 +750,16 @@ def blend_usage(quality, offers, weight=None):
 
 
 class Chain:
-    def __init__(self, client, netuid):
-        self.client, self.netuid = client, netuid
+    def __init__(self, client, netuid, genesis=GENESIS):
+        self.client, self.netuid, self.genesis = client, netuid, genesis
 
     async def snapshot(self):
-        if await self.client._substrate.block_hash(0) != GENESIS:
+        if await self.client._substrate.block_hash(0) != self.genesis:
             raise Blocked('Wrong genesis; signing refused')
         self.block = await self.client.finalized_block()
         self.block_hash = await self.client._substrate.block_hash(self.block)
         if not await self.query('NetworksAdded', [self.netuid]):
-            raise Blocked('Test subnet not registered')
+            raise Blocked('Subnet not registered')
 
     async def query(self, item, params):
         return await self.client.query(('SubtensorModule', item), params, block=self.block)
@@ -801,8 +807,9 @@ async def run(c, ev, submit=False):
     import bittensor as bt
     from bittensor.wallet import Wallet
     policy = bt.Policy(max_fee_tao='0.01', max_spend_tao=0, allowed_netuids=[c['netuid']])
-    async with bt.Subtensor(network=ENDPOINT, policy=policy, fallback_endpoints=[], archive_endpoints=[]) as client:
-        chain = Chain(client, c['netuid'])
+    endpoint, genesis = NETWORKS[c['network']]
+    async with bt.Subtensor(network=endpoint, policy=policy, fallback_endpoints=[], archive_endpoints=[]) as client:
+        chain = Chain(client, c['netuid'], genesis)
         await chain.snapshot()
         offers = await chain.bind(load_offers(c))
         if not offers:
@@ -837,7 +844,7 @@ async def run(c, ev, submit=False):
         current = {o.fingerprint for o in load_offers(c)}
         offers = [o for o in offers if o.fingerprint in current]
         scores, metrics = weights(offers, ev, c['models'])
-        report = {'network': 'test', 'netuid': c['netuid'], 'version': VERSION,
+        report = {'network': c['network'], 'netuid': c['netuid'], 'version': VERSION,
                   'block': chain.block_hash, 'weights': scores, 'metrics': metrics,
                   'model_provenance': 'not_proven', 'status': 'evaluation_only'}
         if not submit:
@@ -890,7 +897,8 @@ async def run(c, ev, submit=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=True)
-    parser.add_argument('--submit-testnet', action='store_true')
+    parser.add_argument('--submit', '--submit-testnet', dest='submit', action='store_true',
+                        help='Submit weights on chain (otherwise evaluate only)')
     parser.add_argument('--watch', action='store_true')
     args = parser.parse_args()
     os.umask(0o077)
@@ -905,7 +913,7 @@ def main():
         ev.bind_config(c)
         while True:
             try:
-                report = asyncio.run(run(c, ev, args.submit_testnet))
+                report = asyncio.run(run(c, ev, args.submit))
                 (state / 'latest.json').write_text(json.dumps(report, indent=2))
                 print(json.dumps({'status': report['status'], 'miners': len(report['weights'])}), flush=True)
             except Exception as error:

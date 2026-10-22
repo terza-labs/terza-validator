@@ -109,6 +109,12 @@ class ValidatorTests(unittest.TestCase):
         result,_=weights([a,offer('b','unselected')],E(),['model'])
         self.assertEqual(result,{'a':1})
 
+    def test_network_selection(self):
+        from terza_validator import validate_config, NETWORKS
+        validate_config({**CONFIG,'network':'finney','netuid':103})
+        with self.assertRaises(ValueError): validate_config({**CONFIG,'network':'local'})
+        self.assertNotEqual(NETWORKS['finney'][1], NETWORKS['test'][1])
+
     def test_organic_success_is_a_gate(self):
         class E:
             def recent(self,f): return samples()
@@ -278,9 +284,10 @@ class ValidatorTests(unittest.TestCase):
             def broke(*_):raise Inconclusive('gateway_402')
             e.sample(o,'arithmetic','round',broke)
             self.assertEqual(len(e.recent(o.fingerprint)),1, 'validator-side problems never count against a miner')
-            c={'netuid':1,'validator_hotkey':'v','models':['m']}
+            c={'network':'test','netuid':1,'validator_hotkey':'v','models':['m']}
             e.bind_config(c)
             with self.assertRaises(ValueError):e.bind_config({**c,'netuid':2})
+            with self.assertRaises(ValueError):e.bind_config({**c,'network':'finney'})
             e.db.close()
 
     def test_mainnet_and_root_refused(self):
@@ -349,7 +356,7 @@ class SubmissionTests(unittest.IsolatedAsyncioTestCase):
                                   (str(i),s['round'],o.fingerprint,s['family'],s['started'],1,1,1))
                 ev.db.commit()
                 ev.sample=lambda *args:None
-                c={'netuid':1,'models':['model'],'validator_hotkey':'v','wallet_name':'validator',
+                c={'network':'test','netuid':1,'models':['model'],'validator_hotkey':'v','wallet_name':'validator',
                    'wallet_hotkey':'validator','wallet_path':d,'password_file':'not-used'}
                 f=FakeChainClient(); f.calls=0
                 async def plan(*args):return types.SimpleNamespace(ok=True)
